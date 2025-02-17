@@ -1,0 +1,19 @@
+[Unit]
+Description=SMTP Proxy Service
+After=network.target
+
+[Service]
+Type=simple
+User=mattia
+Group=mattia
+WorkingDirectory=/path/to/smtpproxy
+ExecStart=/path/to/smtpproxy/venv/bin/python /path/to/smtpproxy/proxy.py
+Restart=always
+Environment=PATH=/path/to/smtpproxy/venv/bin:/usr/bin:/bin
+Environment=VIRTUAL_ENV=/path/to/smtpproxy/venv
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

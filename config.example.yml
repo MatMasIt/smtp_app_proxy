@@ -1,0 +1,19 @@
+smtp_proxy:
+  host: "localhost"
+  port: 1025
+
+
+smtp_server:
+  host: "smtp.mailserver.com"
+  port: 587
+  user: "your_email@mailserver.com"
+  password: "your_password"
+  from_name: "Your Name"
+  from_email: "your_email@mailserver.com"
+
+
+apps:
+  app1@localhost:
+    password: "pw1"
+  app2@localhost:
+    password: "pw2"
