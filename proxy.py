@@ -21,7 +21,7 @@ import jsonschema
 from jsonschema import validate
 import threading
 import queue
-
+import copy
 class FIFOQueueLock:
     def __init__(self):
         self.queue = queue.Queue()  # FIFO queue to hold request tickets
@@ -92,8 +92,6 @@ config_schema = {
             }
         },
         "gpg": {
-            "anyOf": [
-                {
                     "type": "object",
                     "properties": {
                         "home": {"type": "string"},
@@ -115,16 +113,12 @@ config_schema = {
                         "email_http_keyserver": {"type": "string"}
                     },
                     "required": ["home", "enabled", "absent_notice", "email_http_keyserver"]
-                },
-                {
-                    "type": "null"  # Allows the key to be absent or null
-                }
-            ]
+        
         },
         "id_domain": {"type": "string"},
         "email_http_keyserver": {"type": "string"}
     },
-    "required": ["smtp_proxy", "smtp_server", "apps", "gpg", "id_domain"]
+    "required": ["smtp_proxy", "smtp_server", "apps", "id_domain"]
 }
 
 
@@ -134,7 +128,6 @@ config_schema = {
 def load_config(config_file="config.yml"):
     """Load the YAML configuration file."""
     try:
-        CONFIG_LOCK.acquire()
         with open(config_file, "r") as file:
             config = yaml.safe_load(file)
 
@@ -150,9 +143,6 @@ def load_config(config_file="config.yml"):
     except Exception as e:
         logger.error(f"❌ Error loading configuration: {e}")
         raise
-    finally:
-        CONFIG_LOCK.release()
-
 
 # ---------------------------
 # Check Port Availability
@@ -174,8 +164,8 @@ def setup_logging():
     """Set up logging configuration with a single stream handler."""
     logger = logging.getLogger()  # Get the root logger
 
-    # Set the logging level to DEBUG
-    logger.setLevel(logging.DEBUG)
+    # Set the logging level to INFO (use DEBUG to debug)
+    logger.setLevel(logging.INFO)
 
     # Create a stream handler to output logs to stdout
     stream_handler = logging.StreamHandler(sys.stdout)
@@ -224,8 +214,6 @@ def get_conf(param: str):
         return config["apps"]
     elif param == "PASSPHRASE":
         return config["gpg"]["passphrase"] if get_conf("GPG_ENABLED") and "passphrase" in config["gpg"] else None
-    elif param == "GPG_ENABLE":
-        return config["gpg"]["enable"] if get_conf("GPG_ENABLED") else False
     elif param == "WARN_ABSENT_GPG":
         return config["gpg"]["absent_notice"]["enabled"] if get_conf("GPG_ENABLED") else False
     elif param == "GPG_ABSENT_NOTICE_TEXT":
@@ -237,12 +225,12 @@ def get_conf(param: str):
     elif param == "KEYSERVER_URL":
         return config["gpg"]["email_http_keyserver"] if get_conf("GPG_ENABLED") else None
     elif param == "GPG_ENABLED":
-        return "gpg" in config and gpg["enabled"]
+        return "gpg" in config and config["gpg"]["enabled"]
     else:
         raise ValueError(f"Unknown parameter: {param}")
     
     
-if "gpg in config":        
+if get_conf("GPG_ENABLED"):        
     gpg = gnupg.GPG(gnupghome=config["gpg"]["home"])
     gpg.encoding = "utf-8"
 else: 
@@ -260,13 +248,14 @@ class ConfigReloadHandler(FileSystemEventHandler):
         try:
             global gpg, config
             """Triggered when the config file is modified."""
-            if event.src_path == "config.yml":
+            if event.src_path == "config.yml" or event.src_path == "./config.yml":
                 logger.info("🔄 Configuration file changed, reloading...")
                 try:
                     new_config = load_config("config.yml")  # Reload the config
                     if new_config["smtp_proxy"]["host"] != config["smtp_proxy"]["host"] \
                         or new_config["smtp_proxy"]["port"] != new_config["smtp_proxy"]["port"]:
                         config = new_config
+                        logger.info("Port/host changed. Restarting server")
                         if controller is not None:
                             controller.stop()
                             CONFIG_LOCK.clear()
@@ -278,10 +267,17 @@ class ConfigReloadHandler(FileSystemEventHandler):
                         gpg.encoding = "utf-8"
                     else: 
                         gpg = None
-
-                    logger.info("✅ Configuration reloaded.")
+                    
+                    clog =  copy.deepcopy(config)
+                    redaction =  "[REDACTED]"
+                    if "gpg" in clog and "passphrase" in clog["gpg"]:
+                        clog["gpg"]["passphrase"] = redaction
+                    clog["smtp_server"]["password"] = redaction
+                    for username in clog["apps"]:
+                        clog["apps"][username]["password"] = redaction
+                    logger.info(f"✅ Configuration reloaded. New config in memory: {yaml.dump(clog, default_flow_style=False)}")
                 except Exception as e:
-                    logger.error(f"❌ Error reloading configuration: {e}")
+                    logger.error(f"❌ Error reloading configuration: {e}. Keeping old config")
         finally:
             CONFIG_LOCK.release()
 
