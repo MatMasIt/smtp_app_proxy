@@ -17,3 +17,7 @@ apps:
     password: "pw1"
   app2@localhost:
     password: "pw2"
+
+gpg:
+  home: "/home/user/.gnupg"
+  passphrase: "phrase"
