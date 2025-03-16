@@ -3,3 +3,4 @@ PyYAML==6.0.2
 watchdog==6.0.0
 python-gnupg==0.5.4
 requests==2.32.3
+jsonschema==4.23.0

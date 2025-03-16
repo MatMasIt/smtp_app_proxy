@@ -2,7 +2,6 @@ smtp_proxy:
   host: "localhost"
   port: 1025
 
-
 smtp_server:
   host: "smtp.mailserver.com"
   port: 587
@@ -11,13 +10,27 @@ smtp_server:
   from_name: "Your Name"
   from_email: "your_email@mailserver.com"
 
-
 apps:
   app1@localhost:
     password: "pw1"
   app2@localhost:
     password: "pw2"
 
-gpg:
+gpg: # optional
   home: "/home/user/.gnupg"
   passphrase: "phrase"
+  enabled: true
+  absent_notice:
+    enabled: true # Wether to issue a notice if recipient does not use GPG (PGP)
+    text: "\n\n⚠️ This email was sent without end-to-end encryption.\n
+      This mail server supports automatic PGP encryption.\n
+      Consider setting up a PGP key and publishing it to keys.openpgp.org."
+    html:
+      "<p><strong>⚠️ This email was sent without end-to-end encryption.</strong><br>
+      This mail server supports automatic PGP encryption.<br>
+      Consider setting up a PGP key and publishing it to keys.openpgp.org.</p>"
+    # either text, html or both
+
+id_domain: "mytest" # For Message ids
+
+email_http_keyserver: "https://keys.openpgp.org/vks/v1/by-email/"

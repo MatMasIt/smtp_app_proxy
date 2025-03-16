@@ -4,14 +4,11 @@ import base64
 import socket
 import yaml
 import signal
-from email import message_from_bytes
 from email.parser import BytesParser
 from email.policy import default
-from email.message import EmailMessage
+from email.message import Message
 from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
-from email.encoders import encode_base64
 from aiosmtpd.controller import Controller
 from aiosmtpd.smtp import AuthResult, Envelope, Session
 import gnupg
@@ -19,6 +16,116 @@ import sys
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 import requests
+import uuid
+import jsonschema
+from jsonschema import validate
+import threading
+import queue
+
+class FIFOQueueLock:
+    def __init__(self):
+        self.queue = queue.Queue()  # FIFO queue to hold request tickets
+        self.lock = threading.Lock()  # Lock to synchronize access to the queue
+        self.condition = threading.Condition(self.lock)  # Condition variable for notifying
+
+    def acquire(self):
+        with self.lock:
+            ticket = object()  # Create a unique ticket for this thread
+            self.queue.put(ticket)  # Add the ticket to the queue
+
+        # Wait until our ticket reaches the front of the queue
+        with self.lock:
+            while self.queue.queue[0] is not ticket:
+                self.condition.wait()  # Block the thread until it is its turn
+
+    def release(self):
+        with self.lock:
+            self.queue.get()  # Remove our ticket from the queue
+            self.condition.notify_all()  # Notify the next thread in line
+
+    def clear(self):
+        """Clear all pending threads in the queue by notifying them."""
+        with self.lock:
+            # Clear the queue by removing all items
+            self.queue.queue.clear()  # This will clear the queue (all pending tickets)
+            # Notify all waiting threads that they can continue
+            self.condition.notify_all()  # Wake up all waiting threads, effectively releasing them
+
+
+# Create a lock
+CONFIG_LOCK = FIFOQueueLock()
+# if we have requests in progress, they will finish before the config is applied, and the next ones will have it
+
+config_schema = {
+    "type": "object",
+    "properties": {
+        "smtp_proxy": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string"},
+                "port": {"type": "integer"}
+            },
+            "required": ["host", "port"]
+        },
+        "smtp_server": {
+            "type": "object",
+            "properties": {
+                "host": {"type": "string"},
+                "port": {"type": "integer"},
+                "user": {"type": "string"},
+                "password": {"type": "string"},
+                "from_name": {"type": "string"},
+                "from_email": {"type": "string"}
+            },
+            "required": ["host", "port", "user", "password", "from_name", "from_email"]
+        },
+        "apps": {
+            "type": "object",
+            "patternProperties": {
+                "^[a-z0-9._%+-]+@[a-z0-9.-]+\\.[a-z]{2,}$": {
+                    "type": "object",
+                    "properties": {
+                        "password": {"type": "string"}
+                    },
+                    "required": ["password"]
+                }
+            }
+        },
+        "gpg": {
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "home": {"type": "string"},
+                        "passphrase": {"type": "string"},
+                        "enabled": {"type": "boolean"},
+                        "absent_notice": {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {"type": "boolean"},
+                                "text": {"type": "string"},
+                                "html": {"type": "string"}
+                            },
+                            "anyOf": [
+                                { "required": ["text"] },
+                                { "required": ["html"] },
+                                { "required": ["text", "html"] }
+                            ]
+                        },
+                        "email_http_keyserver": {"type": "string"}
+                    },
+                    "required": ["home", "enabled", "absent_notice", "email_http_keyserver"]
+                },
+                {
+                    "type": "null"  # Allows the key to be absent or null
+                }
+            ]
+        },
+        "id_domain": {"type": "string"},
+        "email_http_keyserver": {"type": "string"}
+    },
+    "required": ["smtp_proxy", "smtp_server", "apps", "gpg", "id_domain"]
+}
 
 
 # ---------------------------
@@ -27,13 +134,24 @@ import requests
 def load_config(config_file="config.yml"):
     """Load the YAML configuration file."""
     try:
+        CONFIG_LOCK.acquire()
         with open(config_file, "r") as file:
             config = yaml.safe_load(file)
+
+            validate(instance=config, schema=config_schema)
             logger.info("✅ Configuration loaded successfully.")
             return config
+    except yaml.YAMLError as e:
+        logger.error(f"❌ YAML Error: {e}")
+        raise
+    except jsonschema.exceptions.ValidationError as e:
+        logger.error(f"❌ Schema Validation Error: {e.message}")
+        raise
     except Exception as e:
         logger.error(f"❌ Error loading configuration: {e}")
         raise
+    finally:
+        CONFIG_LOCK.release()
 
 
 # ---------------------------
@@ -76,6 +194,61 @@ def setup_logging():
 logger = setup_logging()
 
 
+controller = None
+
+# ---------------------------
+# Initialize Configuration
+# ---------------------------
+config = load_config("config.yml")
+
+
+
+def get_conf(param: str):
+    if param == "PROXY_HOST":
+        return config["smtp_proxy"]["host"]
+    elif param == "PROXY_PORT":
+        return config["smtp_proxy"]["port"]
+    elif param == "SMTP_SERVER_HOST":
+        return config["smtp_server"]["host"]
+    elif param == "SMTP_SERVER_PORT":
+        return config["smtp_server"]["port"]
+    elif param == "SMTP_USER":
+        return config["smtp_server"]["user"]
+    elif param == "SMTP_PASSWORD":
+        return config["smtp_server"]["password"]
+    elif param == "SMTP_FROM_NAME":
+        return config["smtp_server"]["from_name"]
+    elif param == "SMTP_FROM_EMAIL":
+        return config["smtp_server"]["from_email"]
+    elif param == "APP_CREDENTIALS":
+        return config["apps"]
+    elif param == "PASSPHRASE":
+        return config["gpg"]["passphrase"] if get_conf("GPG_ENABLED") and "passphrase" in config["gpg"] else None
+    elif param == "GPG_ENABLE":
+        return config["gpg"]["enable"] if get_conf("GPG_ENABLED") else False
+    elif param == "WARN_ABSENT_GPG":
+        return config["gpg"]["absent_notice"]["enabled"] if get_conf("GPG_ENABLED") else False
+    elif param == "GPG_ABSENT_NOTICE_TEXT":
+        return config["gpg"]["absent_notice"]["text"] if get_conf("GPG_ENABLED") else None
+    elif param == "GPG_ABSENT_NOTICE_HTML":
+        return config["gpg"]["absent_notice"]["html"] if get_conf("GPG_ENABLED") else None
+    elif param == "ID_DOMAIN":
+        return config["id_domain"]
+    elif param == "KEYSERVER_URL":
+        return config["gpg"]["email_http_keyserver"] if get_conf("GPG_ENABLED") else None
+    elif param == "GPG_ENABLED":
+        return "gpg" in config and gpg["enabled"]
+    else:
+        raise ValueError(f"Unknown parameter: {param}")
+    
+    
+if "gpg in config":        
+    gpg = gnupg.GPG(gnupghome=config["gpg"]["home"])
+    gpg.encoding = "utf-8"
+else: 
+    gpg = None
+
+
 # ---------------------------
 # Watchdog for Configuration Reload
 # ---------------------------
@@ -83,41 +256,34 @@ class ConfigReloadHandler(FileSystemEventHandler):
     """Handler to reload the config when the config file changes."""
 
     def on_modified(self, event):
-        """Triggered when the config file is modified."""
-        if event.src_path == "config.yml":
-            logger.info("🔄 Configuration file changed, reloading...")
-            try:
-                global config
-                config = load_config("config.yml")  # Reload the config
-                logger.info("✅ Configuration reloaded.")
-            except Exception as e:
-                logger.error(f"❌ Error reloading configuration: {e}")
+        CONFIG_LOCK.acquire()
+        try:
+            global gpg, config
+            """Triggered when the config file is modified."""
+            if event.src_path == "config.yml":
+                logger.info("🔄 Configuration file changed, reloading...")
+                try:
+                    new_config = load_config("config.yml")  # Reload the config
+                    if new_config["smtp_proxy"]["host"] != config["smtp_proxy"]["host"] \
+                        or new_config["smtp_proxy"]["port"] != new_config["smtp_proxy"]["port"]:
+                        config = new_config
+                        if controller is not None:
+                            controller.stop()
+                            CONFIG_LOCK.clear()
+                            controller.start()
+                    else:
+                        config = new_config
+                    if get_conf("GPG_ENABLED"):        
+                        gpg = gnupg.GPG(gnupghome=config["gpg"]["home"])
+                        gpg.encoding = "utf-8"
+                    else: 
+                        gpg = None
 
-
-# ---------------------------
-# Initialize Configuration
-# ---------------------------
-config = load_config("config.yml")
-
-# Extract configuration details
-PROXY_HOST = config["smtp_proxy"]["host"]
-PROXY_PORT = config["smtp_proxy"]["port"]
-
-SMTP_SERVER_HOST = config["smtp_server"]["host"]
-SMTP_SERVER_PORT = config["smtp_server"]["port"]
-SMTP_USER = config["smtp_server"]["user"]
-SMTP_PASSWORD = config["smtp_server"]["password"]
-SMTP_FROM_NAME = config["smtp_server"]["from_name"]
-SMTP_FROM_EMAIL = config["smtp_server"]["from_email"]
-
-
-APP_CREDENTIALS = config["apps"]  # Allowed users' credentials
-PASSPHRASE = config["gpg"]["passphrase"]
-
-gpg = gnupg.GPG(gnupghome=config["gpg"]["home"])
-gpg.encoding = "utf-8"
-
-KEYSERVER_URL = "https://keys.openpgp.org/vks/v1/by-email/"
+                    logger.info("✅ Configuration reloaded.")
+                except Exception as e:
+                    logger.error(f"❌ Error reloading configuration: {e}")
+        finally:
+            CONFIG_LOCK.release()
 
 
 # ---------------------------
@@ -129,7 +295,7 @@ class EmailAuthenticator:
     """
 
     def __init__(self):
-        self.APP_CREDENTIALS = APP_CREDENTIALS
+       pass
 
     async def __call__(self, server, session, envelope, mechanism, auth_data):
         fail_nothandled = AuthResult(success=False, handled=False)
@@ -154,9 +320,10 @@ class EmailAuthenticator:
                     return fail_nothandled
                 username, password = decoded.split("\x00")
 
+            app_credentials = get_conf("APP_CREDENTIALS") # avoid race condition in if
             if (
-                username in self.APP_CREDENTIALS
-                and self.APP_CREDENTIALS[username]["password"] == password
+                username in app_credentials
+                and app_credentials[username]["password"] == password
             ):
                 logger.info(f"✅ Authentication successful for {username}")
                 return AuthResult(success=True)
@@ -180,11 +347,13 @@ class EmailProxy:
     rewrites the 'From' header, and forwards the email via the specified SMTP server.
     """
 
-    async def handle_EHLO(self, server, session: Session, envelope: Envelope, hostname):
+    async def handle_EHLO(
+        self, server, session: Session, envelope: Envelope, hostname
+    ) -> str:
         """Handle the EHLO command and advertise AUTH support."""
         session.host_name = hostname
         return (
-            "250-think-server\r\n"
+            "250-smtp-mailproxy\r\n"
             "250-SIZE 33554432\r\n"
             "250-8BITMIME\r\n"
             "250-SMTPUTF8\r\n"
@@ -192,59 +361,76 @@ class EmailProxy:
             "250 HELP"
         )
 
-    async def handle_DATA(self, server, session: Session, envelope: Envelope):
-        """
-        Handle the DATA command, log the email, modify the From header,
-        and forward the email via the specified SMTP server.
-        """
-        mailfrom = envelope.mail_from
-        rcpttos = envelope.rcpt_tos
-        data = envelope.content
+    async def handle_DATA(self, server, session: Session, envelope: Envelope) -> str:
 
-        logger.info(f"📩 Received email from {mailfrom} to {rcpttos}")
+        CONFIG_LOCK.acquire()
+        try:
+            """
+            Handle the DATA command, log the email, modify the From header,
+            and forward the email via the specified SMTP server.
+            """
+            mailfrom = envelope.mail_from
+            rcpttos = envelope.rcpt_tos
+            data = envelope.content
 
-        # Log the email content
-        logger.debug(f"Mail data:\n{data.decode('utf-8', errors='replace')}")
+            logger.info(f"📩 Received email from {mailfrom} to {rcpttos}")
 
-        # Parse the email
-        msg = BytesParser(policy=default).parsebytes(data)
+            # Log the email content
+            logger.debug(f"Mail data:\n{data.decode('utf-8', errors='replace')}")
 
-        # Modify the "From" header with the configuration details
-        msg.replace_header("From", f"{SMTP_FROM_NAME} <{SMTP_FROM_EMAIL}>")
+            # Parse the email
+            msg = BytesParser(policy=default).parsebytes(data)
 
-        encrypted_recipients = []
-        unencrypted_recipients = []
+            # Modify the "From" header with the configuration details
+            msg.replace_header("From", f"{get_conf("SMTP_FROM_NAME")} <{get_conf("SMTP_FROM_EMAIL")}>")
 
-        for recipient in rcpttos:
-            if self.fetch_pgp_key(recipient):
-                encrypted_recipients.append(recipient)
-            else:
-                unencrypted_recipients.append(recipient)
+            encrypted_recipients = []
+            unencrypted_recipients = []
 
-        bcc_recipients = []
-        if "Bcc" in msg:
-            bcc_recipients = msg["Bcc"].split(",")
-            del msg["Bcc"]
+            for recipient in rcpttos:
+                if get_conf("GPG_ENABLED") and  self.fetch_pgp_key(recipient):
+                    encrypted_recipients.append(recipient)
+                else:
+                    unencrypted_recipients.append(recipient)
 
-        if encrypted_recipients:
-            encrypted_msg = self.encrypt_mime_email(msg, encrypted_recipients)
-            if encrypted_msg:
-                self.send_email(encrypted_msg, encrypted_recipients)
+            bcc_recipients = []
+            if "Bcc" in msg:
+                bcc_recipients = msg["Bcc"].split(",")
+                del msg["Bcc"]
 
-        if unencrypted_recipients:
-            plaintext_msg = self.add_unencrypted_warning(msg)
-            self.send_email(plaintext_msg, unencrypted_recipients)
+            if "X-Mailer" in msg:
+                del msg["X-Mailer"]
 
-        # Send separate emails to each BCC recipient for privacy
-        for bcc in bcc_recipients:
-            if bcc in encrypted_recipients:
-                self.send_email(self.encrypt_mime_email(msg, [bcc]), [bcc])
-            else:
-                self.send_email(self.add_unencrypted_warning(msg), [bcc])
+            msg.replace_header(
+                "Message-ID", "<" + str(uuid.uuid4()) + "@" + get_conf("ID_DOMAIN") + ">"
+            )
 
-        return "250 OK"
+            if encrypted_recipients:
+                encrypted_msg = self.encrypt_mime_email(msg, encrypted_recipients)
+                if encrypted_msg:
+                    self.send_email(encrypted_msg, encrypted_recipients)
 
-    def fetch_pgp_key(self, email):
+            if unencrypted_recipients:
+                plaintext_msg = (
+                    self.add_unencrypted_warning(msg) if get_conf("WARN_ABSENT_GPG") else msg
+                )
+                self.send_email(plaintext_msg, unencrypted_recipients)
+
+            # Send separate emails to each BCC recipient for privacy
+            for bcc in bcc_recipients:
+                if bcc in encrypted_recipients:
+                    self.send_email(self.encrypt_mime_email(msg, [bcc]), [bcc])
+                else:
+                    self.send_email(
+                        self.add_unencrypted_warning(msg) if get_conf("WARN_ABSENT_GPG") else msg, [bcc]
+                    )
+
+            return "250 OK"
+        finally:
+            CONFIG_LOCK.release()
+
+
+    def fetch_pgp_key(self, email: str) -> bool:
         """Checks if a PGP key exists locally or fetches it from the keyserver."""
 
         # Check if the key exists locally
@@ -257,9 +443,9 @@ class EmailProxy:
         logger.info(f"🔍 Looking up PGP key for {email} on keyserver...")
 
         # Request the key from the keyserver API
-        keyserver_url = f"{KEYSERVER_URL}{email}"
+        key_url = f"{get_conf("KEYSERVER_URL")}{email}"
         try:
-            response = requests.get(keyserver_url)
+            response = requests.get(key_url)
 
             if response.status_code == 200:
                 key_data = response.text
@@ -287,73 +473,100 @@ class EmailProxy:
             logger.error(f"❌ Error while contacting keyserver: {e}")
             return False
 
-    def encrypt_mime_email(self, msg, recipients):
-        """Encrypts a full email as PGP/MIME with multiple recipients and hides the subject."""
-        original_subject = msg["Subject"]
-        msg.replace_header("Subject", "...")
+    def encrypt_mime_email(self, msg: Message, recipients: list[str]) -> MIMEMultipart:
+        """Encrypts a full email as PGP/MIME, including attachments, and sets the subject to '...'."""
+        # msg.replace_header("Subject", "...")
 
-        
-        # Convert email to MIME
-        mime_msg = MIMEMultipart()
-        mime_msg["Subject"] = "..."
-        mime_msg["From"] = msg["From"]
-        mime_msg["To"] = ", ".join(recipients)
+        # Create a new MIME message to hold the encrypted content
+        encrypted_email = MIMEMultipart(
+            "encrypted", protocol="application/pgp-encrypted"
+        )
+        encrypted_email["Subject"] = msg["Subject"]
+        encrypted_email["From"] = msg["From"]
+        encrypted_email["To"] = ", ".join(recipients)
 
-        # Add original subject inside encrypted content
-        text_part = MIMEText(f"Subject: {original_subject}\n\n{msg.as_string()}")
-        mime_msg.attach(text_part)
+        # Add Autocrypt header (optional, for Autocrypt support)
+        autocrypt_key = self.get_autocrypt_key(get_conf("SMTP_FROM_EMAIL"))
+        if autocrypt_key:
+            encrypted_email["Autocrypt"] = autocrypt_key
 
-        # Encrypt with all recipient keys
+        # PGP version header
+        pgp_header = MIMEBase("application", "pgp-encrypted")
+        pgp_header.add_header("Content-Description", "PGP/MIME version identification")
+        pgp_header.set_payload("Version: 1\r\n")
+        encrypted_email.attach(pgp_header)
+
+        # Encrypt the email body and attachments
+        encrypted_part = self.encrypt_message_with_attachments(msg, recipients)
+        if not encrypted_part:
+            logger.error("❌ Failed to encrypt message with attachments.")
+            return None
+
+        # Attach the encrypted payload
+        encrypted_email.attach(encrypted_part)
+
+        return encrypted_email
+
+    def get_autocrypt_key(self, email: str) -> str:
+        # Fetch the public key for the given email
+        keys = gpg.list_keys(keys=email)
+        if not keys:
+            logger.warning(f"❌ No PGP key found for {email} in the GPG keyring.")
+            return None
+
+        # Export the public key in ASCII-armored format
+        key_data = gpg.export_keys(email, armor=True)
+        if not key_data:
+            logger.error(f"❌ Failed to export PGP key for {email}.")
+            return None
+
+        # Encode the key data in base64
+        keydata_base64 = base64.b64encode(key_data.encode("utf-8")).decode("utf-8")
+
+        # Construct the Autocrypt header
+        autocrypt_header = f"addr={email}; keydata={keydata_base64}"
+
+        return autocrypt_header
+
+    def encrypt_message_with_attachments(
+        self, msg: Message, recipients: list[str]
+    ) -> MIMEBase:
+        """Encrypts the entire MIME body as a single unit."""
+        # Convert the entire message to a string
+        message_str = msg.as_string()
+
+        # Encrypt the entire message
         encrypted_data = gpg.encrypt(
-            mime_msg.as_string(),
+            message_str,
             recipients=recipients,
-            sign=SMTP_FROM_EMAIL,
+            sign=get_conf("SMTP_FROM_EMAIL"),
             always_trust=True,
-            passphrase=PASSPHRASE,
+            passphrase=get_conf("PASSPHRASE")
         )
 
         if not encrypted_data.ok:
             logger.error(f"❌ Encryption failed: {encrypted_data.stderr}")
             return None
 
-        # Create PGP/MIME encrypted email
-        encrypted_email = MIMEMultipart(
-            "encrypted", protocol="application/pgp-encrypted"
-        )
-        encrypted_email["Subject"] = "Encrypted Message"
-        encrypted_email["From"] = msg["From"]
-        encrypted_email["To"] = ", ".join(recipients)
-
-        # PGP version header
-        pgp_header = MIMEBase("application", "pgp-encrypted")
-        pgp_header.add_header("Content-Description", "PGP/MIME Versions Header")
-        pgp_header.set_payload("Version: 1\r\n")
-        encrypted_email.attach(pgp_header)
-
-        # Encrypted email payload
+        # Create the encrypted payload part
         encrypted_part = MIMEBase("application", "octet-stream")
         encrypted_part.set_payload(str(encrypted_data))
+        encrypted_part.add_header("Content-Description", "OpenPGP encrypted message")
         encrypted_part.add_header(
             "Content-Disposition", "inline", filename="encrypted.asc"
         )
-        encrypted_email.attach(encrypted_part)
 
-        return encrypted_email
+        return encrypted_part
 
-    def add_unencrypted_warning(self, msg):
+    def add_unencrypted_warning(self, msg: Message) -> Message:
         """Adds a warning footer to unencrypted emails for both plain-text and HTML bodies."""
-        warning_text = (
-            "\n\n⚠️ This email was sent without end-to-end encryption.\n"
-            "This mail server supports automatic PGP encryption.\n"
-            "Consider setting up a PGP key and publishing it to a keyserver (e.g., keys.openpgp.org)."
-        )
 
         # For multipart emails (text/plain + text/html)
         if msg.is_multipart():
             for part in msg.walk():
                 # Check if the part is plain text
                 if part.get_content_type() == "text/plain":
-                    part.set_payload(part.get_payload() + warning_text)
+                    part.set_payload(part.get_payload() + get_conf("GPG_ABSENT_NOTICE_TEXT"))
                 # Check if the part is HTML text
                 elif part.get_content_type() == "text/html":
                     html_warning = (
@@ -369,27 +582,24 @@ class EmailProxy:
         else:
             # If it's a non-multipart message (either plain-text or HTML only)
             if msg.get_content_type() == "text/plain":
-                msg.set_payload(msg.get_payload() + warning_text)
+                msg.set_payload(msg.get_payload() + get_conf("GPG_ABSENT_NOTICE_TEXT"))
             elif msg.get_content_type() == "text/html":
-                html_warning = (
-                    f"<p><strong>⚠️ This email was sent without end-to-end encryption.</strong><br>"
-                    f"This mail server supports automatic PGP encryption.<br>"
-                    f"Consider setting up a PGP key and publishing it to a keyserver "
-                    f"(e.g., keys.openpgp.org).</p>"
-                )
-                msg.set_payload(msg.get_payload() + html_warning)
+                msg.set_payload(msg.get_payload() + get_conf("GPG_ABSENT_NOTICE_HTML"))
                 msg.replace_header("Content-Transfer-Encoding", "quoted-printable")
 
         return msg
 
-    def send_email(self, msg, recipients):
+    def send_email(self, msg: Message, recipients: list[str]) -> None:
         """Sends an email via SMTP, ensuring BCC recipients remain private."""
+
         try:
             logger.info(f"📤 Sending email to {recipients} via SMTP...")
-            with smtplib.SMTP(SMTP_SERVER_HOST, SMTP_SERVER_PORT) as smtp_server:
+            with smtplib.SMTP(get_conf("SMTP_SERVER_HOST"), get_conf("SMTP_SERVER_PORT")) as smtp_server:
                 smtp_server.starttls()
-                smtp_server.login(SMTP_USER, SMTP_PASSWORD)
-                smtp_server.sendmail(SMTP_FROM_EMAIL, recipients, msg.as_bytes())
+                smtp_server.login(get_conf("SMTP_USER"), get_conf("SMTP_PASSWORD"))
+                smtp_server.sendmail(
+                    get_conf("SMTP_FROM_EMAIL"), recipients, msg.as_string().encode("utf-8")
+                )
             logger.info(f"✅ Email successfully sent to {recipients}")
         except Exception as e:
             logger.error(f"❌ Failed to send email: {e}")
@@ -399,9 +609,10 @@ class EmailProxy:
 # Run the Proxy Server
 # ---------------------------
 def run_proxy():
+    global controller
     """Run the SMTP proxy server."""
-    if not is_port_available(PROXY_HOST, PROXY_PORT):
-        logger.error(f"❌ Port {PROXY_PORT} on {PROXY_HOST} is already in use.")
+    if not is_port_available(get_conf("PROXY_HOST"), get_conf("PROXY_PORT")):
+        logger.error(f"❌ Port {get_conf("PROXY_PORT")} on {get_conf("PROXY_HOST")} is already in use.")
         exit(1)
 
     try:
@@ -412,8 +623,8 @@ def run_proxy():
         smtp_handler = EmailProxy()
         controller = Controller(
             smtp_handler,
-            hostname=PROXY_HOST,
-            port=PROXY_PORT,
+            hostname=get_conf("PROXY_HOST"),
+            port=get_conf("PROXY_PORT"),
             authenticator=authenticator,
             auth_require_tls=False,
         )
@@ -423,10 +634,11 @@ def run_proxy():
         config_watcher.schedule(ConfigReloadHandler(), ".", recursive=False)
         config_watcher.start()
 
-        logger.info(f"🚀 SMTP Proxy started on {PROXY_HOST}:{PROXY_PORT}")
+        logger.info(f"🚀 SMTP Proxy started on {get_conf("PROXY_HOST")}:{get_conf("PROXY_PORT")}")
         controller.start()
         sig = signal.sigwait([signal.SIGINT, signal.SIGQUIT])
         logger.warning(f"{sig} caught, shutting down")
+        CONFIG_LOCK.clear()
         controller.stop()
         config_watcher.stop()
         config_watcher.join()
