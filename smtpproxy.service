@@ -13,6 +13,7 @@ Environment=PATH=/path/to/smtpproxy/venv/bin:/usr/bin:/bin
 Environment=VIRTUAL_ENV=/path/to/smtpproxy/venv
 StandardOutput=journal
 StandardError=journal
+SyslogIdentifier=smtpproxy
 
 [Install]
 WantedBy=multi-user.target

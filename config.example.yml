@@ -22,11 +22,11 @@ gpg: # optional
   enabled: true
   absent_notice:
     enabled: true # Wether to issue a notice if recipient does not use GPG (PGP)
-    text: "\n\n⚠️ This email was sent without end-to-end encryption.\n
+    text: "\n\nNote: This email was sent without end-to-end encryption.\n
       This mail server supports automatic PGP encryption.\n
       Consider setting up a PGP key and publishing it to keys.openpgp.org."
     html:
-      "<p><strong>⚠️ This email was sent without end-to-end encryption.</strong><br>
+      "<p><strong>Note: This email was sent without end-to-end encryption.</strong><br>
       This mail server supports automatic PGP encryption.<br>
       Consider setting up a PGP key and publishing it to keys.openpgp.org.</p>"
     # either text, html or both
