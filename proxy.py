@@ -217,9 +217,9 @@ def get_conf(param: str):
     elif param == "WARN_ABSENT_GPG":
         return config["gpg"]["absent_notice"]["enabled"] if get_conf("GPG_ENABLED") else False
     elif param == "GPG_ABSENT_NOTICE_TEXT":
-        return config["gpg"]["absent_notice"]["text"] if get_conf("GPG_ENABLED") else None
+        return config["gpg"]["absent_notice"]["text"] if get_conf("GPG_ENABLED") and "text" in config["gpg"]["absent_notice"] else None
     elif param == "GPG_ABSENT_NOTICE_HTML":
-        return config["gpg"]["absent_notice"]["html"] if get_conf("GPG_ENABLED") else None
+        return config["gpg"]["absent_notice"]["html"] if get_conf("GPG_ENABLED")  and "html" in config["gpg"]["absent_notice"] else None
     elif param == "ID_DOMAIN":
         return config["id_domain"]
     elif param == "KEYSERVER_URL":
@@ -561,25 +561,22 @@ class EmailProxy:
         if msg.is_multipart():
             for part in msg.walk():
                 # Check if the part is plain text
-                if part.get_content_type() == "text/plain":
+                if part.get_content_type() == "text/plain" and  get_conf("GPG_ABSENT_NOTICE_TEXT") is not None:
                     part.set_payload(part.get_payload() + get_conf("GPG_ABSENT_NOTICE_TEXT"))
                 # Check if the part is HTML text
-                elif part.get_content_type() == "text/html":
-                    html_warning = (
-                        f"<p><strong>⚠️ This email was sent without end-to-end encryption.</strong><br>"
-                        f"This mail server supports automatic PGP encryption.<br>"
-                        f"Consider setting up a PGP key and publishing it to a keyserver "
-                        f"(e.g., keys.openpgp.org).</p>"
-                    )
-                    part.set_payload(part.get_payload() + html_warning)
-                    part.replace_header(
-                        "Content-Transfer-Encoding", "quoted-printable"
-                    )  # Ensure HTML part is encoded correctly
+                elif part.get_content_type() == "text/html" and  get_conf("GPG_ABSENT_NOTICE_HTML") is not None:
+                    part.set_payload(part.get_payload() +  get_conf("GPG_ABSENT_NOTICE_HTML"))
+                    try:
+                        part.replace_header(
+                            "Content-Transfer-Encoding", "quoted-printable"
+                        )  # Ensure HTML part is encoded correctly
+                    except KeyError:
+                        part["Content-Transfer-Encoding"] = "quoted-printable"
         else:
             # If it's a non-multipart message (either plain-text or HTML only)
-            if msg.get_content_type() == "text/plain":
+            if msg.get_content_type() == "text/plain" and get_conf("GPG_ABSENT_NOTICE_TEXT") is not None:
                 msg.set_payload(msg.get_payload() + get_conf("GPG_ABSENT_NOTICE_TEXT"))
-            elif msg.get_content_type() == "text/html":
+            elif msg.get_content_type() == "text/html" and get_conf("GPG_ABSENT_NOTICE_HTML") is not None:
                 msg.set_payload(msg.get_payload() + get_conf("GPG_ABSENT_NOTICE_HTML"))
                 msg.replace_header("Content-Transfer-Encoding", "quoted-printable")
 
