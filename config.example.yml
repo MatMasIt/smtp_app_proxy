@@ -30,7 +30,7 @@ gpg: # optional
       This mail server supports automatic PGP encryption.<br>
       Consider setting up a PGP key and publishing it to keys.openpgp.org.</p>"
     # either text, html or 
-    email_http_keyserver: "https://keys.openpgp.org/vks/v1/by-email/"
+  email_http_keyserver: "https://keys.openpgp.org/vks/v1/by-email/"
 
 id_domain: "mytest" # For Message ids
 
